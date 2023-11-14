@@ -111,6 +111,8 @@ function unwrap_annotation(@nospecialize(c))
     end
     return c
 end
+
+function dummy end
     
 function Core.Compiler.abstract_call_gf_by_type(interp::EnzymeInterpreter, @nospecialize(f),
         arginfo::ArgInfo, si::StmtInfo, @nospecialize(atype), sv::InferenceState, max_methods::Int)
@@ -184,12 +186,24 @@ function Core.Compiler.abstract_call_gf_by_type(interp::EnzymeInterpreter, @nosp
                 expr = Expr(:lambda, args,
                     Expr(Symbol("scope-block"), quote
                         thunk = $(FMT(compile_result.adjoint))
-                        $(Expr(:call, :thunk, args...))
+                        $(Expr(:call, :thunk, args[2:end]...))
                 end))
                 CI = @ccall jl_expand_and_resolve(expr::Any, Enzyme::Any, Core.Compiler.svec()::Core.SimpleVector)::Any
-                # infer CI
+                # infer CI (see https://github.com/JuliaLang/julia/blob/9729f312186c70de4f5209dfa0d0fdf0f1669ee6/stdlib/REPL/src/REPLCompletions.jl#L631)
 
-                @show Core.OpaqueClosure(CI)
+                dummy_mi = @ccall jl_new_method_instance_uninit()::Ref{Core.MethodInstance}
+                @show dummy_mi.specTypes = Core.Compiler.signature_type(dummy, argtypes_to_type(inner_argtypes))
+
+                dummy_mi.def = Enzyme
+                @atomic dummy_mi.uninferred = CI
+
+                @show result = Core.Compiler.InferenceResult(dummy_mi, Core.Compiler.SimpleArgtypes(Any[typeof(dummy), inner_argtypes...]))
+                @show result.argtypes
+                frame = Core.Compiler.InferenceState(result, CI, #=cache=#:no, interp.parent)
+                Core.Compiler.typeinf(interp.parent, frame)
+
+                @show frame.src
+                @show oc = Core.OpaqueClosure(frame.src)
 
                 # TODO: Cache
                 # ci = get(rinterp.unopt[rinterp.current_level], mi, nothing)
