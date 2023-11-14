@@ -1,6 +1,7 @@
 module Enzymanigans
 
 import EnzymeCore
+import Enzyme
 
 include("codecache.jl")
 const GLOBAL_CI_CACHE = CodeCache()
@@ -88,18 +89,25 @@ function whichtt(mtv::MethodTableView, sig)
     return match.method
 end
 
+primal(c::EnzymeCore.Const) = c.val
+primal(c::EnzymeCore.Duplicated) = c.val
+
 function unwrap_annotation(@nospecialize(c))
     if c isa Core.Compiler.Const
-        v = widenconst(c)
-        if v <: Type{<:EnzymeCore.Annotation}
-            v = v.parameters[1]
-            return Core.Compiler.Const(Type{eltype(v)})
-        end
-        if v <: EnzymeCore.Annotation 
+        v = c.val
+        if v isa Type && v <: EnzymeCore.Annotation
             return Core.Compiler.Const(eltype(v))
+        end
+        if v isa EnzymeCore.Annotation 
+            return Core.Compiler.Const(primal(v))
         end
     elseif widenconst(c) != c
         error("Unhandled $c")
+    elseif c <: Type{<:EnzymeCore.Annotation}
+        c = c.parameters[1]
+        return Type{eltype(c)}
+    else c <: EnzymeCore.Annotation 
+        return eltype(c)
     end
     return c
 end
@@ -119,7 +127,7 @@ function Core.Compiler.abstract_call_gf_by_type(interp::EnzymeInterpreter, @nosp
                 @info "Found EnzymeCore.autodiff with full information"
                 rt_activity = widenconst(maybe_rt_activity)
                 inner_argtypes = argtypes[5:end] # strip rt_activity from primal
-                pushfirst!(inner_argtypes, argtypes[3])
+                pushfirst!(inner_argtypes, argtypes[3]) # push func
                 primal_argtypes = anymap(unwrap_annotation, inner_argtypes)
 
                 # 1. Infer primal
@@ -128,34 +136,60 @@ function Core.Compiler.abstract_call_gf_by_type(interp::EnzymeInterpreter, @nosp
                 call = Core.Compiler.abstract_call_gf_by_type(interp.parent,
                     f, ArgInfo(nothing, primal_argtypes), StmtInfo(true), argtypes_to_type(primal_argtypes), sv, max_methods)
 
+                @show call
                 # 2. Obtain MI
-                if isa(call.info, MethodMatchInfo)
-                    if length(call.info.results.matches) == 0
+                info = call.info
+                if call.info isa Core.Compiler.ConstCallInfo
+                    info = info.call
+                end
+                if info isa MethodMatchInfo
+                    if length(info.results.matches) == 0
                         @error "Found no matching call" primal_argtypes
                         error("Enzyme compilation failed")
                     end
-                    mi = specialize_method(only(call.info.results.matches), preexisting=true)
+                    mi = specialize_method(only(info.results.matches), preexisting=true)
                 else
-                    @error "Unknown" call.info call
+                    @error "Unknown" info call
                     error("")
                 end
 
+                # TODO: This is clunky
+                width = Enzyme.same_or_one(anymap(widenconst, inner_argtypes)...)
+                mode = Enzyme.API.DEM_ForwardMode
+
+                rt_activity = only(rt_activity.parameters)
+                ReturnPrimal = rt_activity <: EnzymeCore.Duplicated || rt_activity <: EnzymeCore.BatchDuplicated
+                ModifiedBetween = ntuple(_->false, length(primal_argtypes))
+                ShadowInit = false
+
                 # 4. Compile
+                params = Enzyme.Compiler.EnzymeCompilerParams(
+                    argtypes_to_type(inner_argtypes),
+                    mode, width, rt_activity, #=run_enzyme=# true,  #=abiwrap=#true,
+                    ModifiedBetween, ReturnPrimal, ShadowInit, Enzyme.Compiler.UnknownTapeType, Enzyme.Compiler.FFIABI)
+                @info "Configuration..." params rt_activity
+            
+                job = Enzyme.Compiler.CompilerJob(mi, Enzyme.Compiler.CompilerConfig(Enzyme.Compiler.EnzymeTarget(), params; kernel=false), interp.world)
+                compile_result = Enzyme.Compiler.JuliaContext() do ctx # TODO: ctx should be sunk
+                    Enzyme.Compiler.cached_compilation(job) # TODO this takes a lock. Safe from here?
+                end
+                FMT = Enzyme.Compiler.ForwardModeThunk{typeof(compile_result.adjoint), widenconst(ft_activity), rt_activity, Tuple{params.TT.parameters[2:end]...}, Val{width}, Val(ReturnPrimal)}
 
-                # params = Enzyme.Compiler.EnzymeCompilerParams(
-                #     # Tuple{FA, TT.parameters...}, Mode, width, rt2, true, #=abiwrap=#true, ModifiedBetween, ReturnPrimal, ShadowInit, UnknownTapeType, ABI)
-                # job    = Enzyme.Compiler.CompilerJob(mi, CompilerConfig(target, params; kernel=false), interp.world)
-
-                # compile_result = Enzyme.Compiler.cached_compilation(job) # TODO this takes a lock. Safe from here?
-
-                # FMT = ForwardModeThunk{typeof(compile_result.adjoint), FA, rt2, Tuple{params.TT.parameters[2:end]...}, Val{width}, Val(ReturnPrimal)}
+                args = [Symbol("#self#")]
+                for i in 1:length(primal_argtypes)
+                    push!(args, Symbol("arg_$i"))
+                end
                 
                 # 3. Create an OpaqueClosure that contains the thunk statically and the enzymecall
-                # expr = quote
-                #     Base.@_inline_meta
-                #     thunk = $FMT($(compile_result.adjoint))
-                #     thunk(args...)
-                # end
+                expr = Expr(:lambda, args,
+                    Expr(Symbol("scope-block"), quote
+                        thunk = $(FMT(compile_result.adjoint))
+                        $(Expr(:call, :thunk, args...))
+                end))
+                CI = @ccall jl_expand_and_resolve(expr::Any, Enzyme::Any, Core.Compiler.svec()::Core.SimpleVector)::Any
+                # infer CI
+
+                @show Core.OpaqueClosure(CI)
 
                 # TODO: Cache
                 # ci = get(rinterp.unopt[rinterp.current_level], mi, nothing)
@@ -168,11 +202,6 @@ function Core.Compiler.abstract_call_gf_by_type(interp::EnzymeInterpreter, @nosp
             else
                 @error "Unkown mode" mode
             end
-            # @show ft = inner_argtypes[2]
-            # @show inner_argtypes[3:end]
-            # # Use Parent to infer rt
-            # f = singleton_type(ft)
-            # # primal_argtypes 
 
             # call = Core.Compiler.abstract_call_gf_by_type(interp.parent,
             #         f, ArgInfo(nothing, inner_argtypes), StmtInfo(true), argtypes_to_type(inner_argtypes), sv, max_methods)
